@@ -9,7 +9,7 @@ loaded directly (in addition to the original wide-format CSV layout) via
 SpectroChemPy's OMNIC reader.
 """
 from __future__ import annotations
-import json, sys, traceback
+import json, re, sys, traceback
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -42,37 +42,73 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as Navigation
 from matplotlib.figure import Figure
 
 META_DEFAULT=["SampleID","Brand","Grade","City","State","Year"]
+SAMPLE_ID_YEAR_RE=re.compile(r"^\s*(\d{4})\.\d+")
+
+def parse_year_from_sample_id(sample_id):
+    """Extract the yyyy year from a SampleID formatted as yyyy.nnnn (e.g. 2024.0007)."""
+    m=SAMPLE_ID_YEAR_RE.match(str(sample_id))
+    return m.group(1) if m else ""
+
+def load_metadata_table(path):
+    """Load a metadata spreadsheet (.csv or .xlsx/.xls) with SampleID, Brand, Grade,
+    City, State columns (case-insensitive, any column order; extra columns ignored)."""
+    p=Path(path)
+    df=pd.read_excel(p) if p.suffix.lower() in (".xlsx",".xls") else pd.read_csv(p)
+    colmap={str(c).strip().lower():c for c in df.columns}
+    required=["sampleid","brand","grade","city","state"]
+    missing=[r for r in required if r not in colmap]
+    if missing: raise ValueError(f"Metadata spreadsheet is missing required column(s): {', '.join(missing)}. "
+                                  f"Found columns: {', '.join(str(c) for c in df.columns)}")
+    return pd.DataFrame({
+        "SampleID":df[colmap["sampleid"]].astype(str).str.strip(),
+        "Brand":df[colmap["brand"]],"Grade":df[colmap["grade"]],"City":df[colmap["city"]],"State":df[colmap["state"]],
+    })
+
+def apply_metadata_table(meta,metadata_df):
+    """Merge a metadata spreadsheet into `meta` by exact SampleID match (SampleID is
+    expected to be the .spa filename stem). Year is always derived from SampleID.
+    Unmatched samples are kept with blank Brand/Grade/City/State and reported."""
+    lookup={str(sid).strip():row for sid,row in zip(metadata_df["SampleID"],metadata_df.to_dict("records"))}
+    brand=[]; grade=[]; city=[]; state=[]; year=[]; unmatched=[]
+    for sid in meta["SampleID"].astype(str):
+        row=lookup.get(sid.strip())
+        if row is None:
+            unmatched.append(sid); brand.append(""); grade.append(""); city.append(""); state.append("")
+        else:
+            brand.append(row.get("Brand","")); grade.append(row.get("Grade","")); city.append(row.get("City","")); state.append(row.get("State",""))
+        year.append(parse_year_from_sample_id(sid))
+    meta=meta.copy(); meta["Brand"]=brand; meta["Grade"]=grade; meta["City"]=city; meta["State"]=state; meta["Year"]=year
+    return meta,unmatched
 
 def load_spa_files(paths):
     """Load one or more Thermo/Nicolet OMNIC .spa files via SpectroChemPy.
 
     Returns (meta, wavenumbers, spectra_df) in the same shape as load_ftir_csv
-    so both input paths feed the same downstream analysis pipeline.
+    so both input paths feed the same downstream analysis pipeline. SampleID is
+    always the file's stem (name without extension) and rows are kept in the
+    same order as `paths`, so metadata spreadsheets can reliably be matched by
+    filename. Year is parsed from SampleID (yyyy.nnnn format).
     """
     if scp is None: raise RuntimeError(f"SpectroChemPy is not available: {SCP_IMPORT_ERROR}")
     paths=[Path(p) for p in paths]
     if not paths: raise ValueError("No .spa files were selected.")
-    ds=scp.read_omnic(*[str(p) for p in paths], merge=True)
+    ds=scp.read_omnic(*[str(p) for p in paths], merge=True, sortbydate=False)
     if isinstance(ds,(list,tuple)):
         raise ValueError("Selected .spa files have inconsistent wavenumber axes and cannot be merged. "
                           "Make sure all spectra were collected with the same instrument range/resolution.")
     wn=np.asarray(ds.x.data,dtype=float); data=np.asarray(ds.data,dtype=float)
     if data.ndim==1: data=data[None,:]
-    labels=None
-    y=getattr(ds,"y",None)
-    lab=getattr(y,"labels",None) if y is not None else None
-    if lab is not None:
-        lab=np.asarray(lab)
-        if lab.ndim==2 and lab.shape[1]>=1: labels=[str(v) for v in lab[:,-1]]
-        elif lab.ndim==1: labels=[str(v) for v in lab]
-    if not labels or len(labels)!=data.shape[0]: labels=[p.stem for p in paths[:data.shape[0]]]
-    meta=pd.DataFrame({"SampleID":labels})
-    for col in META_DEFAULT[1:]: meta[col]=""
+    if data.shape[0]!=len(paths):
+        raise ValueError(f"Expected {len(paths)} spectra but SpectroChemPy returned {data.shape[0]}; "
+                          "cannot reliably match filenames to samples.")
+    stems=[p.stem for p in paths]
+    meta=pd.DataFrame({"SampleID":stems,"Brand":"","Grade":"","City":"","State":"",
+                        "Year":[parse_year_from_sample_id(s) for s in stems]})
     order=np.argsort(wn)
     spectra=pd.DataFrame(data[:,order])
     return meta.reset_index(drop=True),wn[order],spectra.reset_index(drop=True)
 
-def export_spa_csv(paths,csv_path):
+def export_spa_csv(paths,csv_path,metadata_file=None):
     """Combine individual .spa files into one nicely formatted wide CSV.
 
     Produces a plain header row (SampleID, Brand, Grade, City, State, Year,
@@ -80,13 +116,23 @@ def export_spa_csv(paths,csv_path):
     supports via its numeric-column-name auto-detection, so the exported file
     can be reloaded directly in "Wide-format CSV" mode, opened in Excel with
     readable column names, or shared/edited like any other dataset.
+
+    If `metadata_file` is given (a spreadsheet with SampleID/Brand/Grade/City/State
+    columns), those values are merged in by matching SampleID to each .spa file's
+    filename stem; Year is always derived from SampleID (yyyy.nnnn).
+    Returns (n_samples, n_wavenumbers, unmatched_sample_ids).
     """
     meta,wn,spectra=load_spa_files(paths)
+    unmatched=[]
+    if metadata_file:
+        metadata_df=load_metadata_table(metadata_file)
+        meta,unmatched=apply_metadata_table(meta,metadata_df)
     columns=list(META_DEFAULT)+[f"{w:.4f}" for w in wn]
     out=pd.concat([meta[META_DEFAULT].reset_index(drop=True),spectra.reset_index(drop=True)],axis=1)
     out.columns=columns
     out.to_csv(csv_path,index=False)
-    return len(meta),len(wn)
+    return len(meta),len(wn),unmatched
+
 
 def load_ftir_csv(path):
     raw=pd.read_csv(path,low_memory=False)
@@ -130,12 +176,18 @@ def scp_preprocess(ds,method,window,poly):
     return scp.snv(scp.savgol(ds,size=window,order=poly,deriv=deriv))
 
 def load_dataset(cfg):
-    if cfg["mode"]=="spa": return load_spa_files(cfg["spa_files"])
-    return load_ftir_csv(cfg["input"])
+    if cfg["mode"]=="spa":
+        meta,wn,xdf=load_spa_files(cfg["spa_files"])
+        unmatched=[]
+        if cfg.get("metadata_file"):
+            metadata_df=load_metadata_table(cfg["metadata_file"])
+            meta,unmatched=apply_metadata_table(meta,metadata_df)
+        return meta,wn,xdf,unmatched
+    meta,wn,xdf=load_ftir_csv(cfg["input"]); return meta,wn,xdf,[]
 
 def analyze(cfg,progress=lambda x:None):
     if scp is None: raise RuntimeError(f"SpectroChemPy is not available: {SCP_IMPORT_ERROR}")
-    progress(5); meta,wn,xdf=load_dataset(cfg)
+    progress(5); meta,wn,xdf,unmatched=load_dataset(cfg)
     mask=(wn>=cfg["min_wn"])&(wn<=cfg["max_wn"])
     for a,b in cfg["exclude"]: mask &= ~((wn>=a)&(wn<=b))
     wn=wn[mask]; xdf=xdf.loc[:,mask]
@@ -161,10 +213,10 @@ def analyze(cfg,progress=lambda x:None):
     progress(65); pcs=[f"PC{i+1}" for i in range(n)]
     score_df=pd.concat([meta,pd.DataFrame(scores,columns=pcs)],axis=1); score_df["KMeansCluster"]=km; score_df["AgglomerativeCluster"]=ag; score_df["DBSCANCluster"]=db
     load_df=pd.DataFrame(loadings.T,index=wn,columns=pcs); load_df.index.name="Wavenumber_cm-1"
-    summary={"samples":len(meta),"wavenumbers_retained":len(wn),"preprocessing":cfg["preprocessing"],"excluded_ranges":cfg["exclude"],"PC1_percent":100*ev_ratio[0],"PC2_percent":100*ev_ratio[1],"PC1_PC2_percent":100*sum(ev_ratio[:2]),"components_for_95_percent":n95,"variance_in_fitted_PCs_percent":100*cum[-1],"selected_k":best_k,"best_silhouette":float(kval.silhouette.max()),"kmeans_agglomerative_ARI":float(adjusted_rand_score(km,ag)),"dbscan_clusters":len(set(db))-(-1 in db),"dbscan_noise_samples":int((db==-1).sum()),"dbscan_eps":eps}
+    summary={"samples":len(meta),"wavenumbers_retained":len(wn),"preprocessing":cfg["preprocessing"],"excluded_ranges":cfg["exclude"],"PC1_percent":100*ev_ratio[0],"PC2_percent":100*ev_ratio[1],"PC1_PC2_percent":100*sum(ev_ratio[:2]),"components_for_95_percent":n95,"variance_in_fitted_PCs_percent":100*cum[-1],"selected_k":best_k,"best_silhouette":float(kval.silhouette.max()),"kmeans_agglomerative_ARI":float(adjusted_rand_score(km,ag)),"dbscan_clusters":len(set(db))-(-1 in db),"dbscan_noise_samples":int((db==-1).sum()),"dbscan_eps":eps,"unmatched_metadata_samples":unmatched}
     out=Path(cfg["output"]); out.mkdir(parents=True,exist_ok=True)
     score_df.to_csv(out/"pca_scores_and_clusters.csv",index=False); load_df.to_csv(out/"pca_loadings.csv"); kval.to_csv(out/"kmeans_silhouette.csv",index=False); (out/"analysis_summary.json").write_text(json.dumps(summary,indent=2))
-    progress(80); return {"meta":meta,"wn":wn,"X":X,"ev_ratio":ev_ratio,"loadings_arr":loadings,"scores":scores,"scores_df":score_df,"loadings":load_df,"kval":kval,"summary":summary,"z":z}
+    progress(80); return {"meta":meta,"wn":wn,"X":X,"ev_ratio":ev_ratio,"loadings_arr":loadings,"scores":scores,"scores_df":score_df,"loadings":load_df,"kval":kval,"summary":summary,"z":z,"unmatched_metadata_samples":unmatched}
 
 class Worker(QObject):
     done=Signal(object); failed=Signal(str); progress=Signal(int)
@@ -237,7 +289,12 @@ class MainWindow(QMainWindow):
         bclr=QPushButton("Clear all"); bclr.clicked.connect(self.clear_spa_files)
         bexp=QPushButton("Export combined CSV…"); bexp.clicked.connect(self.export_spa_csv)
         spa_btn_row.addWidget(badd); spa_btn_row.addWidget(brem); spa_btn_row.addWidget(bclr); spa_btn_row.addWidget(bexp); spa_btn_row.addStretch(1)
-        spa_col.addWidget(self.spa_list); spa_col.addLayout(spa_btn_row)
+        spa_meta_row=QHBoxLayout()
+        self.spa_metadata=QLineEdit(); self.spa_metadata.setPlaceholderText("Optional: spreadsheet with SampleID, Brand, Grade, City, State columns")
+        bmeta=QPushButton("Load metadata spreadsheet…"); bmeta.clicked.connect(self.browse_spa_metadata)
+        bmetaclr=QPushButton("Clear"); bmetaclr.clicked.connect(lambda: self.spa_metadata.setText(""))
+        spa_meta_row.addWidget(QLabel("Metadata")); spa_meta_row.addWidget(self.spa_metadata,1); spa_meta_row.addWidget(bmeta); spa_meta_row.addWidget(bmetaclr)
+        spa_col.addWidget(self.spa_list); spa_col.addLayout(spa_btn_row); spa_col.addLayout(spa_meta_row)
         self.input_stack.addWidget(spa_page)
 
         grid=QGridLayout(); outer.addLayout(grid)
@@ -275,6 +332,15 @@ class MainWindow(QMainWindow):
     def remove_spa_files(self):
         for it in self.spa_list.selectedItems(): self.spa_list.takeItem(self.spa_list.row(it))
     def clear_spa_files(self): self.spa_list.clear()
+    def browse_spa_metadata(self):
+        p,_=QFileDialog.getOpenFileName(self,"Select metadata spreadsheet","","Spreadsheets (*.csv *.xlsx *.xls);;All files (*)")
+        if p: self.spa_metadata.setText(p)
+    def _warn_unmatched(self,unmatched):
+        if not unmatched: return
+        shown=", ".join(unmatched[:20])+(", …" if len(unmatched)>20 else "")
+        QMessageBox.warning(self,"Unmatched samples",
+            f"{len(unmatched)} .spa sample(s) had no matching SampleID in the metadata spreadsheet "
+            f"and were kept with blank Brand/Grade/City/State:\n{shown}")
     def export_spa_csv(self):
         files=[self.spa_list.item(i).data(Qt.UserRole) for i in range(self.spa_list.count())]
         if not files: QMessageBox.warning(self,"Export combined CSV","Add at least one .spa file first."); return
@@ -282,10 +348,11 @@ class MainWindow(QMainWindow):
         p,_=QFileDialog.getSaveFileName(self,"Save combined CSV",default,"CSV files (*.csv)")
         if not p: return
         try:
-            n_samples,n_wn=export_spa_csv(files,p)
+            n_samples,n_wn,unmatched=export_spa_csv(files,p,self.spa_metadata.text().strip() or None)
         except Exception as e:
             QMessageBox.critical(self,"Export failed",str(e)); return
         QMessageBox.information(self,"Export combined CSV",f"Wrote {n_samples} samples x {n_wn} wavenumbers to:\n{p}")
+        self._warn_unmatched(unmatched)
     def browse_output(self):
         p=QFileDialog.getExistingDirectory(self,"Select output folder")
         if p: self.output.setText(p)
@@ -293,6 +360,7 @@ class MainWindow(QMainWindow):
         mode="spa" if self.mode_spa.isChecked() else "csv"
         cfg={"mode":mode,"input":self.input.text().strip(),
              "spa_files":[self.spa_list.item(i).data(Qt.UserRole) for i in range(self.spa_list.count())],
+             "metadata_file":self.spa_metadata.text().strip() or None,
              "output":self.output.text().strip(),"preprocessing":self.pre.currentText(),"min_wn":self.minwn.value(),"max_wn":self.maxwn.value(),
              "exclude":parse_exclusions(self.exclude.text()),"window":self.window.value(),"poly":self.poly.value(),"components":self.components.value(),
              "cluster_pcs":self.clusterpcs.value(),"max_k":self.maxk.value(),"dbscan_quantile":self.dbq.value()}
@@ -309,6 +377,7 @@ class MainWindow(QMainWindow):
     def failed(self,text): self.runbtn.setEnabled(True); self.summary.setPlainText(text); QMessageBox.critical(self,"Analysis failed",text.splitlines()[-1])
     def finished(self,r):
         self.result=r; self.runbtn.setEnabled(True); self.progress.setValue(100); self.summary.setPlainText(json.dumps(r["summary"],indent=2)); self.draw(); self.populate_table(r["scores_df"])
+        self._warn_unmatched(r.get("unmatched_metadata_samples") or [])
     def _select_table_row(self,idx):
         if 0<=idx<self.table.rowCount(): self.table.selectRow(idx); self.table.scrollToItem(self.table.item(idx,0))
     def draw(self):
