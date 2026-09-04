@@ -40,6 +40,12 @@ Two input modes are available in the UI:
   (`spectrochempy.read_omnic`). All selected files must share the same wavenumber axis
   (same instrument range/resolution) to be merged for PCA.
 
+  Use "Export combined CSV…" to write the added `.spa` files out as a single, nicely
+  formatted wide CSV (`SampleID, Brand, Grade, City, State, Year` columns followed by
+  one numeric wavenumber column per data point). The exported file can be reloaded
+  directly in "Wide-format CSV" mode, opened in Excel, or hand-edited to fill in
+  metadata like Brand/Grade before re-analysis.
+
 ## Recommended starting settings
 
 - Preprocessing: First derivative + SNV
