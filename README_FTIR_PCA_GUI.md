@@ -47,12 +47,20 @@ Two input modes are available in the UI:
   directly in "Wide-format CSV" mode, opened in Excel, or hand-edited to fill in
   metadata like Brand/Grade before re-analysis.
 
-  Optionally, load a metadata spreadsheet (`.csv` or `.xlsx`/`.xls`) with `SampleID`,
-  `Brand`, `Grade`, `City`, `State` columns (any order, case-insensitive, extra columns
-  ignored). Each `.spa` file's `SampleID` is its filename without the extension, and is
-  matched exactly against the spreadsheet's `SampleID` column to pull in Brand/Grade/
-  City/State — both for "Export combined CSV…" and for full analysis runs. `Year` is
-  always parsed from `SampleID` assuming a `yyyy.nnnn` naming convention (e.g.
+  Optionally, load a metadata spreadsheet (`.csv` or `.xlsx`/`.xls`, first sheet is
+  used) with `SampleID`, `Brand`, `Grade`, `City`, `State` columns (any order, extra
+  columns ignored). Column names are matched case- and punctuation-insensitively, and
+  the following common alternate names are also recognized:
+  - `SampleID`: `Sample ID`
+  - `Brand`: `MktAbbrev`
+  - `Grade`: `SmplType`
+  - `City`: `CITY`
+  - `State`: `STATE`
+
+  Each `.spa` file's `SampleID` is its filename without the extension, and is matched
+  exactly against the spreadsheet's `SampleID`/`Sample ID` column to pull in
+  Brand/Grade/City/State — both for "Export combined CSV…" and for full analysis runs.
+  `Year` is always parsed from `SampleID` assuming a `yyyy.nnnn` naming convention (e.g.
   `2024.0007.spa` &rarr; Year `2024`), never taken from the spreadsheet. Samples with no
   matching spreadsheet row are kept with blank Brand/Grade/City/State and reported in a
   warning dialog (and listed under `unmatched_metadata_samples` in `analysis_summary.json`).

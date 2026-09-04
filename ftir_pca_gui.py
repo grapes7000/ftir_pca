@@ -49,19 +49,42 @@ def parse_year_from_sample_id(sample_id):
     m=SAMPLE_ID_YEAR_RE.match(str(sample_id))
     return m.group(1) if m else ""
 
+def _normalize_header(s):
+    """Lowercase and strip non-alphanumerics so 'Sample ID', 'sample_id', and
+    'SampleID' all normalize to the same key for column matching."""
+    return re.sub(r"[^a-z0-9]","",str(s).lower())
+
+METADATA_COLUMN_ALIASES={
+    "sampleid":["sampleid"],
+    "brand":["brand","mktabbrev"],
+    "grade":["grade","smpltype"],
+    "city":["city"],
+    "state":["state"],
+}
+
 def load_metadata_table(path):
-    """Load a metadata spreadsheet (.csv or .xlsx/.xls) with SampleID, Brand, Grade,
-    City, State columns (case-insensitive, any column order; extra columns ignored)."""
+    """Load a metadata spreadsheet (.csv or .xlsx/.xls) with sample ID, brand, grade,
+    city, and state columns (any column order; extra columns ignored). Recognized
+    header names (case/spacing-insensitive) are:
+      - SampleID: "SampleID", "Sample ID"
+      - Brand: "Brand", "MktAbbrev"
+      - Grade: "Grade", "SmplType"
+      - City: "City"
+      - State: "State"
+    """
     p=Path(path)
     df=pd.read_excel(p) if p.suffix.lower() in (".xlsx",".xls") else pd.read_csv(p)
-    colmap={str(c).strip().lower():c for c in df.columns}
-    required=["sampleid","brand","grade","city","state"]
-    missing=[r for r in required if r not in colmap]
+    colmap={_normalize_header(c):c for c in df.columns}
+    resolved={}; missing=[]
+    for field,aliases in METADATA_COLUMN_ALIASES.items():
+        col=next((colmap[a] for a in aliases if a in colmap),None)
+        if col is None: missing.append("/".join(aliases))
+        else: resolved[field]=col
     if missing: raise ValueError(f"Metadata spreadsheet is missing required column(s): {', '.join(missing)}. "
                                   f"Found columns: {', '.join(str(c) for c in df.columns)}")
     return pd.DataFrame({
-        "SampleID":df[colmap["sampleid"]].astype(str).str.strip(),
-        "Brand":df[colmap["brand"]],"Grade":df[colmap["grade"]],"City":df[colmap["city"]],"State":df[colmap["state"]],
+        "SampleID":df[resolved["sampleid"]].astype(str).str.strip(),
+        "Brand":df[resolved["brand"]],"Grade":df[resolved["grade"]],"City":df[resolved["city"]],"State":df[resolved["state"]],
     })
 
 def apply_metadata_table(meta,metadata_df):
