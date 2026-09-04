@@ -1,29 +1,78 @@
 #!/usr/bin/env python3
-"""PySide6 desktop UI for reusable FTIR PCA and clustering analysis."""
+"""PySide6 desktop UI for reusable FTIR PCA and clustering analysis.
+
+Preprocessing and PCA are performed with SpectroChemPy (NDDataset, SNV,
+Savitzky-Golay derivatives, PCA). Clustering (KMeans/Agglomerative/DBSCAN),
+which SpectroChemPy does not provide, still uses scikit-learn on the
+SpectroChemPy PCA scores. Individual Thermo/Nicolet OMNIC `.spa` files can be
+loaded directly (in addition to the original wide-format CSV layout) via
+SpectroChemPy's OMNIC reader.
+"""
 from __future__ import annotations
 import json, sys, traceback
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from scipy.signal import savgol_filter
 from scipy.cluster.hierarchy import linkage, dendrogram
 from sklearn.impute import SimpleImputer
-from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
 from sklearn.metrics import silhouette_score, adjusted_rand_score
 from sklearn.neighbors import NearestNeighbors
+
+try:
+    import spectrochempy as scp
+    from spectrochempy import NDDataset, Coord
+    SCP_IMPORT_ERROR = None
+except Exception as _e:  # pragma: no cover - reported at runtime in the UI
+    scp = None; NDDataset = None; Coord = None; SCP_IMPORT_ERROR = str(_e)
+
+try:
+    import mplcursors
+except ImportError:
+    mplcursors = None
 
 from PySide6.QtCore import QObject, QThread, Signal, Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QGridLayout,
  QGroupBox,QLabel,QLineEdit,QPushButton,QFileDialog,QComboBox,QSpinBox,QDoubleSpinBox,QCheckBox,
- QTabWidget,QPlainTextEdit,QTableWidget,QTableWidgetItem,QMessageBox,QProgressBar,QSplitter)
+ QTabWidget,QPlainTextEdit,QTableWidget,QTableWidgetItem,QMessageBox,QProgressBar,QSplitter,
+ QListWidget,QListWidgetItem,QStackedWidget,QRadioButton,QButtonGroup,QAbstractItemView)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
 META_DEFAULT=["SampleID","Brand","Grade","City","State","Year"]
 
-def load_ftir(path):
+def load_spa_files(paths):
+    """Load one or more Thermo/Nicolet OMNIC .spa files via SpectroChemPy.
+
+    Returns (meta, wavenumbers, spectra_df) in the same shape as load_ftir_csv
+    so both input paths feed the same downstream analysis pipeline.
+    """
+    if scp is None: raise RuntimeError(f"SpectroChemPy is not available: {SCP_IMPORT_ERROR}")
+    paths=[Path(p) for p in paths]
+    if not paths: raise ValueError("No .spa files were selected.")
+    ds=scp.read_omnic(*[str(p) for p in paths], merge=True)
+    if isinstance(ds,(list,tuple)):
+        raise ValueError("Selected .spa files have inconsistent wavenumber axes and cannot be merged. "
+                          "Make sure all spectra were collected with the same instrument range/resolution.")
+    wn=np.asarray(ds.x.data,dtype=float); data=np.asarray(ds.data,dtype=float)
+    if data.ndim==1: data=data[None,:]
+    labels=None
+    y=getattr(ds,"y",None)
+    lab=getattr(y,"labels",None) if y is not None else None
+    if lab is not None:
+        lab=np.asarray(lab)
+        if lab.ndim==2 and lab.shape[1]>=1: labels=[str(v) for v in lab[:,-1]]
+        elif lab.ndim==1: labels=[str(v) for v in lab]
+    if not labels or len(labels)!=data.shape[0]: labels=[p.stem for p in paths[:data.shape[0]]]
+    meta=pd.DataFrame({"SampleID":labels})
+    for col in META_DEFAULT[1:]: meta[col]=""
+    order=np.argsort(wn)
+    spectra=pd.DataFrame(data[:,order])
+    return meta.reset_index(drop=True),wn[order],spectra.reset_index(drop=True)
+
+def load_ftir_csv(path):
     raw=pd.read_csv(path,low_memory=False)
     marker=raw.iloc[0,0] if len(raw) else None
     if isinstance(marker,str) and "wavenumber" in marker.lower():
@@ -51,29 +100,40 @@ def parse_exclusions(text):
         a,b=map(float,parts); ranges.append((min(a,b),max(a,b)))
     return ranges
 
-def snv(x):
-    sd=x.std(axis=1,keepdims=True); sd[sd==0]=1
-    return (x-x.mean(axis=1,keepdims=True))/sd
+def to_nddataset(wn,X):
+    return NDDataset(X,coordset=[Coord(np.arange(X.shape[0]),title="sample"),Coord(wn,title="wavenumber",units="cm^-1")])
 
-def preprocess(x,method,window,poly):
-    x=SimpleImputer(strategy="median").fit_transform(x)
+def scp_preprocess(ds,method,window,poly):
+    n_points=ds.shape[-1]
     window=max(poly+2,window); window += (window%2==0)
-    window=min(window,x.shape[1] if x.shape[1]%2 else x.shape[1]-1)
-    if method=="Raw": return x
-    if method=="SNV": return snv(x)
-    if method=="SG smoothing + SNV": return snv(savgol_filter(x,window,poly,axis=1))
+    window=min(window,n_points if n_points%2 else n_points-1)
+    if method=="Raw": return ds
+    if method=="SNV": return scp.snv(ds)
+    if method=="SG smoothing + SNV": return scp.snv(scp.savgol(ds,size=window,order=poly,deriv=0))
     deriv=1 if method=="First derivative + SNV" else 2
-    return snv(savgol_filter(x,window,poly,deriv=deriv,axis=1))
+    return scp.snv(scp.savgol(ds,size=window,order=poly,deriv=deriv))
+
+def load_dataset(cfg):
+    if cfg["mode"]=="spa": return load_spa_files(cfg["spa_files"])
+    return load_ftir_csv(cfg["input"])
 
 def analyze(cfg,progress=lambda x:None):
-    progress(5); meta,wn,xdf=load_ftir(cfg["input"])
+    if scp is None: raise RuntimeError(f"SpectroChemPy is not available: {SCP_IMPORT_ERROR}")
+    progress(5); meta,wn,xdf=load_dataset(cfg)
     mask=(wn>=cfg["min_wn"])&(wn<=cfg["max_wn"])
     for a,b in cfg["exclude"]: mask &= ~((wn>=a)&(wn<=b))
     wn=wn[mask]; xdf=xdf.loc[:,mask]
     if len(wn)<10: raise ValueError("Too few wavenumbers remain after filtering.")
-    progress(20); X=preprocess(xdf.to_numpy(float),cfg["preprocessing"],cfg["window"],cfg["poly"]); X-=X.mean(axis=0)
-    n=min(cfg["components"],len(X)-1,X.shape[1]); pca=PCA(n_components=n,svd_solver="full").fit(X); scores=pca.transform(X)
-    cum=np.cumsum(pca.explained_variance_ratio_); n95=int(np.searchsorted(cum,.95)+1) if cum[-1]>=.95 else None
+    progress(15); Ximp=SimpleImputer(strategy="median").fit_transform(xdf.to_numpy(float))
+    ds=to_nddataset(wn,Ximp)
+    progress(25); ds_p=scp_preprocess(ds,cfg["preprocessing"],cfg["window"],cfg["poly"])
+    X=np.asarray(ds_p.data,dtype=float)
+    n=min(cfg["components"],X.shape[0]-1,X.shape[1])
+    progress(35); pca=scp.PCA(n_components=n); pca.fit(ds_p)
+    scores=np.asarray(pca.scores.data,dtype=float)
+    loadings=np.asarray(pca.loadings.data,dtype=float)
+    ev_ratio=np.asarray(pca.explained_variance_ratio.data,dtype=float)/100.0
+    cum=np.cumsum(ev_ratio); n95=int(np.searchsorted(cum,.95)+1) if cum[-1]>=.95 else None
     nz=max(2,min(n95 or n,cfg["cluster_pcs"],n)); z=scores[:,:nz]
     progress(45); rows=[]
     for k in range(2,min(cfg["max_k"],len(z)-1)+1):
@@ -84,11 +144,11 @@ def analyze(cfg,progress=lambda x:None):
     db=DBSCAN(eps=eps,min_samples=nn).fit_predict(z)
     progress(65); pcs=[f"PC{i+1}" for i in range(n)]
     score_df=pd.concat([meta,pd.DataFrame(scores,columns=pcs)],axis=1); score_df["KMeansCluster"]=km; score_df["AgglomerativeCluster"]=ag; score_df["DBSCANCluster"]=db
-    load_df=pd.DataFrame(pca.components_.T,index=wn,columns=pcs); load_df.index.name="Wavenumber_cm-1"
-    summary={"samples":len(meta),"wavenumbers_retained":len(wn),"preprocessing":cfg["preprocessing"],"excluded_ranges":cfg["exclude"],"PC1_percent":100*pca.explained_variance_ratio_[0],"PC2_percent":100*pca.explained_variance_ratio_[1],"PC1_PC2_percent":100*sum(pca.explained_variance_ratio_[:2]),"components_for_95_percent":n95,"variance_in_fitted_PCs_percent":100*cum[-1],"selected_k":best_k,"best_silhouette":float(kval.silhouette.max()),"kmeans_agglomerative_ARI":float(adjusted_rand_score(km,ag)),"dbscan_clusters":len(set(db))-(-1 in db),"dbscan_noise_samples":int((db==-1).sum()),"dbscan_eps":eps}
+    load_df=pd.DataFrame(loadings.T,index=wn,columns=pcs); load_df.index.name="Wavenumber_cm-1"
+    summary={"samples":len(meta),"wavenumbers_retained":len(wn),"preprocessing":cfg["preprocessing"],"excluded_ranges":cfg["exclude"],"PC1_percent":100*ev_ratio[0],"PC2_percent":100*ev_ratio[1],"PC1_PC2_percent":100*sum(ev_ratio[:2]),"components_for_95_percent":n95,"variance_in_fitted_PCs_percent":100*cum[-1],"selected_k":best_k,"best_silhouette":float(kval.silhouette.max()),"kmeans_agglomerative_ARI":float(adjusted_rand_score(km,ag)),"dbscan_clusters":len(set(db))-(-1 in db),"dbscan_noise_samples":int((db==-1).sum()),"dbscan_eps":eps}
     out=Path(cfg["output"]); out.mkdir(parents=True,exist_ok=True)
     score_df.to_csv(out/"pca_scores_and_clusters.csv",index=False); load_df.to_csv(out/"pca_loadings.csv"); kval.to_csv(out/"kmeans_silhouette.csv",index=False); (out/"analysis_summary.json").write_text(json.dumps(summary,indent=2))
-    progress(80); return {"meta":meta,"wn":wn,"X":X,"pca":pca,"scores":scores,"scores_df":score_df,"loadings":load_df,"kval":kval,"summary":summary,"z":z}
+    progress(80); return {"meta":meta,"wn":wn,"X":X,"ev_ratio":ev_ratio,"loadings_arr":loadings,"scores":scores,"scores_df":score_df,"loadings":load_df,"kval":kval,"summary":summary,"z":z}
 
 class Worker(QObject):
     done=Signal(object); failed=Signal(str); progress=Signal(int)
@@ -97,23 +157,79 @@ class Worker(QObject):
         try: self.done.emit(analyze(self.cfg,self.progress.emit))
         except Exception: self.failed.emit(traceback.format_exc())
 
-class PlotCanvas(FigureCanvas):
-    def __init__(self): self.fig=Figure(figsize=(8,6),tight_layout=True); super().__init__(self.fig)
-    def clear(self): self.fig.clear()
+class PlotCanvas(QWidget):
+    """Matplotlib canvas with a navigation toolbar (pan/zoom/save) plus
+    optional hover tooltips (mplcursors) and click-to-select callbacks,
+    giving every plot tab basic interactivity."""
+    def __init__(self):
+        super().__init__()
+        self.fig=Figure(figsize=(8,6),tight_layout=True)
+        self.canvas=FigureCanvas(self.fig)
+        self.toolbar=NavigationToolbar(self.canvas,self)
+        lay=QVBoxLayout(self); lay.setContentsMargins(0,0,0,0); lay.setSpacing(0)
+        lay.addWidget(self.toolbar); lay.addWidget(self.canvas,1)
+        self._cursors=[]; self._pick_cid=None
+    def clear(self):
+        self.fig.clear()
+        for cur in self._cursors:
+            try: cur.remove()
+            except Exception: pass
+        self._cursors=[]
+        if self._pick_cid is not None:
+            try: self.canvas.mpl_disconnect(self._pick_cid)
+            except Exception: pass
+            self._pick_cid=None
+    def draw(self): self.canvas.draw_idle()
+    def add_hover(self,artists,formatter):
+        """Attach a hover tooltip to one or more artists using mplcursors, if available."""
+        if mplcursors is None or not artists: return
+        cur=mplcursors.cursor(artists,hover=True)
+        @cur.connect("add")
+        def _(sel): sel.annotation.set_text(formatter(sel))
+        self._cursors.append(cur)
+    def on_pick(self,callback):
+        self._pick_cid=self.canvas.mpl_connect("pick_event",callback)
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle("FTIR PCA Workbench"); self.resize(1400,900); self.result=None; self._build()
+        super().__init__(); self.setWindowTitle("FTIR PCA Workbench (SpectroChemPy)"); self.resize(1400,900); self.result=None; self._build()
+        if scp is None:
+            QMessageBox.warning(self,"SpectroChemPy not available",
+                f"SpectroChemPy could not be imported, so analysis will fail until it is installed:\n{SCP_IMPORT_ERROR}\n\n"
+                "Install it with: pip install spectrochempy")
     def _build(self):
         root=QWidget(); self.setCentralWidget(root); layout=QVBoxLayout(root)
-        box=QGroupBox("Dataset and model settings"); grid=QGridLayout(box)
-        self.input=QLineEdit(); b=QPushButton("Browse…"); b.clicked.connect(self.browse_input)
+        box=QGroupBox("Dataset and model settings"); outer=QVBoxLayout(box)
+
+        mode_row=QHBoxLayout(); mode_row.addWidget(QLabel("Input type:"))
+        self.mode_csv=QRadioButton("Wide-format CSV"); self.mode_spa=QRadioButton("Individual .spa files (OMNIC)")
+        self.mode_csv.setChecked(True); self.mode_group=QButtonGroup(self); self.mode_group.addButton(self.mode_csv); self.mode_group.addButton(self.mode_spa)
+        self.mode_csv.toggled.connect(self._on_mode_changed)
+        mode_row.addWidget(self.mode_csv); mode_row.addWidget(self.mode_spa); mode_row.addStretch(1); outer.addLayout(mode_row)
+
+        self.input_stack=QStackedWidget(); outer.addWidget(self.input_stack)
+        csv_page=QWidget(); csv_row=QHBoxLayout(csv_page); csv_row.setContentsMargins(0,0,0,0)
+        self.input=QLineEdit(); bcsv=QPushButton("Browse…"); bcsv.clicked.connect(self.browse_input)
+        csv_row.addWidget(QLabel("Input CSV")); csv_row.addWidget(self.input,1); csv_row.addWidget(bcsv)
+        self.input_stack.addWidget(csv_page)
+
+        spa_page=QWidget(); spa_col=QVBoxLayout(spa_page); spa_col.setContentsMargins(0,0,0,0)
+        self.spa_list=QListWidget(); self.spa_list.setSelectionMode(QAbstractItemView.ExtendedSelection); self.spa_list.setMaximumHeight(90)
+        spa_btn_row=QHBoxLayout()
+        badd=QPushButton("Add .spa files…"); badd.clicked.connect(self.add_spa_files)
+        brem=QPushButton("Remove selected"); brem.clicked.connect(self.remove_spa_files)
+        bclr=QPushButton("Clear all"); bclr.clicked.connect(self.clear_spa_files)
+        spa_btn_row.addWidget(badd); spa_btn_row.addWidget(brem); spa_btn_row.addWidget(bclr); spa_btn_row.addStretch(1)
+        spa_col.addWidget(self.spa_list); spa_col.addLayout(spa_btn_row)
+        self.input_stack.addWidget(spa_page)
+
+        grid=QGridLayout(); outer.addLayout(grid)
         self.output=QLineEdit(str(Path.cwd()/"ftir_pca_results")); bo=QPushButton("Output…"); bo.clicked.connect(self.browse_output)
         self.pre=QComboBox(); self.pre.addItems(["First derivative + SNV","SG smoothing + SNV","SNV","Second derivative + SNV","Raw"])
         self.minwn=self.dspin(400,4000,400); self.maxwn=self.dspin(400,4000,4000); self.exclude=QLineEdit("500-1000")
         self.window=self.spin(5,101,21); self.poly=self.spin(2,5,3); self.components=self.spin(2,100,30); self.clusterpcs=self.spin(2,30,10); self.maxk=self.spin(3,20,10)
         self.dbq=self.dspin(.5,.99,.90,2,.01)
-        controls=[("Input CSV",self.input,b),("Output folder",self.output,bo),("Preprocessing",self.pre,None),("Analysis range minimum",self.minwn,None),("Analysis range maximum",self.maxwn,None),("Excluded ranges",self.exclude,None),("SG window",self.window,None),("SG polynomial",self.poly,None),("PCA components",self.components,None),("PCs used for clustering",self.clusterpcs,None),("Maximum K",self.maxk,None),("DBSCAN neighbor quantile",self.dbq,None)]
+        controls=[("Output folder",self.output,bo),("Preprocessing",self.pre,None),("Analysis range minimum",self.minwn,None),("Analysis range maximum",self.maxwn,None),("Excluded ranges",self.exclude,None),("SG window",self.window,None),("SG polynomial",self.poly,None),("PCA components",self.components,None),("PCs used for clustering",self.clusterpcs,None),("Maximum K",self.maxk,None),("DBSCAN neighbor quantile",self.dbq,None)]
         for i,(lab,w,extra) in enumerate(controls): r=i//3; c=(i%3)*3; grid.addWidget(QLabel(lab),r,c); grid.addWidget(w,r,c+1); extra and grid.addWidget(extra,r,c+2)
         layout.addWidget(box)
         row=QHBoxLayout(); self.runbtn=QPushButton("Run analysis"); self.runbtn.clicked.connect(self.run); self.runbtn.setMinimumHeight(38); self.progress=QProgressBar(); row.addWidget(self.runbtn); row.addWidget(self.progress); layout.addLayout(row)
@@ -122,47 +238,104 @@ class MainWindow(QMainWindow):
         self.canvases={}
         for key,title in [("spectra","Spectra"),("scores","PCA Scores"),("loadings","Loadings"),("variance","Variance"),("clusters","Clusters"),("dendro","Dendrogram")]: c=PlotCanvas(); self.canvases[key]=c; self.tabs.addTab(c,title)
         self.table=QTableWidget(); self.tabs.addTab(self.table,"Scores table")
+    def _on_mode_changed(self,checked):
+        self.input_stack.setCurrentIndex(0 if self.mode_csv.isChecked() else 1)
     def spin(self,a,b,v): w=QSpinBox(); w.setRange(a,b); w.setValue(v); return w
     def dspin(self,a,b,v,dec=1,step=1): w=QDoubleSpinBox(); w.setRange(a,b); w.setDecimals(dec); w.setSingleStep(step); w.setValue(v); return w
     def browse_input(self):
         p,_=QFileDialog.getOpenFileName(self,"Select FTIR CSV","","CSV files (*.csv);;All files (*)")
         if p: self.input.setText(p); self.output.setText(str(Path(p).with_name(Path(p).stem+"_pca_results")))
+    def add_spa_files(self):
+        ps,_=QFileDialog.getOpenFileNames(self,"Select individual FTIR .spa files","","OMNIC spectra (*.spa);;All files (*)")
+        if not ps: return
+        existing={self.spa_list.item(i).data(Qt.UserRole) for i in range(self.spa_list.count())}
+        for p in ps:
+            if p not in existing:
+                it=QListWidgetItem(Path(p).name); it.setData(Qt.UserRole,p); self.spa_list.addItem(it)
+        if self.spa_list.count() and not self.output.text().strip():
+            first=self.spa_list.item(0).data(Qt.UserRole)
+            self.output.setText(str(Path(first).with_name(Path(first).stem+"_pca_results")))
+    def remove_spa_files(self):
+        for it in self.spa_list.selectedItems(): self.spa_list.takeItem(self.spa_list.row(it))
+    def clear_spa_files(self): self.spa_list.clear()
     def browse_output(self):
         p=QFileDialog.getExistingDirectory(self,"Select output folder")
         if p: self.output.setText(p)
-    def config(self): return {"input":self.input.text().strip(),"output":self.output.text().strip(),"preprocessing":self.pre.currentText(),"min_wn":self.minwn.value(),"max_wn":self.maxwn.value(),"exclude":parse_exclusions(self.exclude.text()),"window":self.window.value(),"poly":self.poly.value(),"components":self.components.value(),"cluster_pcs":self.clusterpcs.value(),"max_k":self.maxk.value(),"dbscan_quantile":self.dbq.value()}
+    def config(self):
+        mode="spa" if self.mode_spa.isChecked() else "csv"
+        cfg={"mode":mode,"input":self.input.text().strip(),
+             "spa_files":[self.spa_list.item(i).data(Qt.UserRole) for i in range(self.spa_list.count())],
+             "output":self.output.text().strip(),"preprocessing":self.pre.currentText(),"min_wn":self.minwn.value(),"max_wn":self.maxwn.value(),
+             "exclude":parse_exclusions(self.exclude.text()),"window":self.window.value(),"poly":self.poly.value(),"components":self.components.value(),
+             "cluster_pcs":self.clusterpcs.value(),"max_k":self.maxk.value(),"dbscan_quantile":self.dbq.value()}
+        return cfg
     def run(self):
         try:
             cfg=self.config()
-            if not Path(cfg["input"]).exists(): raise ValueError("Select an input CSV first.")
+            if cfg["mode"]=="csv" and not Path(cfg["input"]).exists(): raise ValueError("Select an input CSV first.")
+            if cfg["mode"]=="spa" and not cfg["spa_files"]: raise ValueError("Add at least one .spa file first.")
+            if not cfg["output"]: raise ValueError("Choose an output folder.")
         except Exception as e: QMessageBox.warning(self,"Settings",str(e)); return
         self.runbtn.setEnabled(False); self.progress.setValue(0); self.summary.setPlainText("Running analysis…")
         self.thread=QThread(); self.worker=Worker(cfg); self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.progress.connect(self.progress.setValue); self.worker.done.connect(self.finished); self.worker.failed.connect(self.failed); self.worker.done.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit); self.thread.start()
     def failed(self,text): self.runbtn.setEnabled(True); self.summary.setPlainText(text); QMessageBox.critical(self,"Analysis failed",text.splitlines()[-1])
     def finished(self,r):
         self.result=r; self.runbtn.setEnabled(True); self.progress.setValue(100); self.summary.setPlainText(json.dumps(r["summary"],indent=2)); self.draw(); self.populate_table(r["scores_df"])
+    def _select_table_row(self,idx):
+        if 0<=idx<self.table.rowCount(): self.table.selectRow(idx); self.table.scrollToItem(self.table.item(idx,0))
     def draw(self):
-        r=self.result; wn=r["wn"]; X=r["X"]; pca=r["pca"]; s=r["scores"]; df=r["scores_df"]
-        c=self.canvases["spectra"]; c.clear(); ax=c.fig.add_subplot(); ax.plot(wn,X[:min(80,len(X))].T,alpha=.16,lw=.6); ax.invert_xaxis(); ax.set(title="Preprocessed spectra",xlabel="Wavenumber (cm⁻¹)",ylabel="Processed intensity"); c.draw()
-        c=self.canvases["scores"]; c.clear(); ax=c.fig.add_subplot();
-        for lab,g in df.groupby("Brand",dropna=False): ax.scatter(g.PC1,g.PC2,s=35,alpha=.75,label=str(lab))
-        ax.set(xlabel=f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)",ylabel=f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)",title="PCA scores by brand"); ax.legend(fontsize=7,ncol=2); c.draw()
+        r=self.result; wn=r["wn"]; X=r["X"]; ev=r["ev_ratio"]; loadings=r["loadings_arr"]; df=r["scores_df"].reset_index(drop=True)
+        sample_labels=df.get("SampleID",pd.Series(range(len(df)))).astype(str).tolist()
+
+        c=self.canvases["spectra"]; c.clear(); ax=c.fig.add_subplot()
+        nshow=min(80,len(X)); lines=ax.plot(wn,X[:nshow].T,alpha=.35,lw=.7,picker=3)
+        ax.invert_xaxis(); ax.set(title="Preprocessed spectra (hover/click a line to identify)",xlabel="Wavenumber (cm⁻¹)",ylabel="Processed intensity")
+        c.add_hover(lines,lambda sel: sample_labels[lines.index(sel.artist)] if sel.artist in lines else "")
+        c.draw()
+
+        c=self.canvases["scores"]; c.clear(); ax=c.fig.add_subplot(); score_artists=[]; score_idx=[]
+        for lab,g in df.groupby("Brand",dropna=False):
+            sc=ax.scatter(g.PC1,g.PC2,s=35,alpha=.75,label=str(lab),picker=5); score_artists.append(sc); score_idx.append(g.index.to_numpy())
+        ax.set(xlabel=f"PC1 ({ev[0]*100:.1f}%)",ylabel=f"PC2 ({ev[1]*100:.1f}%)",title="PCA scores by brand (hover/click a point to identify)"); ax.legend(fontsize=7,ncol=2)
+        c.add_hover(score_artists,lambda sel: sample_labels[score_idx[score_artists.index(sel.artist)][sel.index]])
+        def _pick_scores(event):
+            if event.artist in score_artists:
+                gi=score_idx[score_artists.index(event.artist)]; self._select_table_row(int(gi[event.ind[0]]))
+        c.on_pick(_pick_scores); c.draw()
+
         c=self.canvases["loadings"]; c.clear(); axs=c.fig.subplots(3,1,sharex=True)
-        for i,ax in enumerate(axs): ax.plot(wn,pca.components_[i],lw=.8); ax.set_ylabel(f"PC{i+1}")
+        for i,ax in enumerate(axs): ax.plot(wn,loadings[i],lw=.8); ax.set_ylabel(f"PC{i+1}")
         axs[-1].invert_xaxis(); axs[-1].set_xlabel("Wavenumber (cm⁻¹)"); c.draw()
-        c=self.canvases["variance"]; c.clear(); ax=c.fig.add_subplot(); ev=pca.explained_variance_ratio_; ax.bar(range(1,len(ev)+1),ev*100); ax.plot(range(1,len(ev)+1),np.cumsum(ev)*100,color="darkred",marker="o",ms=3); ax.axhline(95,ls="--",color="gray"); ax.set(title="Explained variance",xlabel="Principal component",ylabel="Percent"); c.draw()
-        c=self.canvases["clusters"]; c.clear(); ax=c.fig.add_subplot();
-        for lab,g in df.groupby("KMeansCluster"): ax.scatter(g.PC1,g.PC2,s=45,alpha=.8,label=f"Cluster {lab}")
-        ax.legend(); ax.set(title="K-Means clusters on PCA scores",xlabel="PC1",ylabel="PC2"); c.draw()
-        c=self.canvases["dendro"]; c.clear(); ax=c.fig.add_subplot(); labels=df.get("SampleID",pd.Series(range(len(df)))).astype(str).tolist(); dendrogram(linkage(r["z"],method="ward"),labels=labels,leaf_rotation=90,leaf_font_size=4,ax=ax); ax.set(title="Ward hierarchical clustering",ylabel="Distance"); c.draw()
+
+        c=self.canvases["variance"]; c.clear(); ax=c.fig.add_subplot(); ax.bar(range(1,len(ev)+1),ev*100,picker=5); ax.plot(range(1,len(ev)+1),np.cumsum(ev)*100,color="darkred",marker="o",ms=3); ax.axhline(95,ls="--",color="gray"); ax.set(title="Explained variance",xlabel="Principal component",ylabel="Percent"); c.draw()
+
+        c=self.canvases["clusters"]; c.clear(); ax=c.fig.add_subplot(); clus_artists=[]; clus_idx=[]
+        for lab,g in df.groupby("KMeansCluster"):
+            sc=ax.scatter(g.PC1,g.PC2,s=45,alpha=.8,label=f"Cluster {lab}",picker=5); clus_artists.append(sc); clus_idx.append(g.index.to_numpy())
+        ax.legend(); ax.set(title="K-Means clusters on PCA scores (hover/click a point to identify)",xlabel="PC1",ylabel="PC2")
+        c.add_hover(clus_artists,lambda sel: sample_labels[clus_idx[clus_artists.index(sel.artist)][sel.index]])
+        def _pick_clusters(event):
+            if event.artist in clus_artists:
+                gi=clus_idx[clus_artists.index(event.artist)]; self._select_table_row(int(gi[event.ind[0]]))
+        c.on_pick(_pick_clusters); c.draw()
+
+        c=self.canvases["dendro"]; c.clear(); ax=c.fig.add_subplot(); dendrogram(linkage(r["z"],method="ward"),labels=sample_labels,leaf_rotation=90,leaf_font_size=4,ax=ax); ax.set(title="Ward hierarchical clustering",ylabel="Distance"); c.draw()
     def populate_table(self,df):
         show=[c for c in ["SampleID","Brand","Grade","City","State","PC1","PC2","PC3","KMeansCluster","AgglomerativeCluster","DBSCANCluster"] if c in df]
         self.table.setRowCount(len(df)); self.table.setColumnCount(len(show)); self.table.setHorizontalHeaderLabels(show)
-        for i,row in df[show].iterrows():
+        for i,row in df[show].reset_index(drop=True).iterrows():
             for j,v in enumerate(row): self.table.setItem(i,j,QTableWidgetItem(f"{v:.5g}" if isinstance(v,(float,np.floating)) else str(v)))
         self.table.resizeColumnsToContents()
 
 if __name__=="__main__":
     app=QApplication(sys.argv); app.setStyle("Fusion"); w=MainWindow()
-    if len(sys.argv)>1: w.input.setText(sys.argv[1]); w.output.setText(str(Path(sys.argv[1]).with_name(Path(sys.argv[1]).stem+"_pca_results")))
+    args=sys.argv[1:]
+    if args:
+        if all(Path(a).suffix.lower()==".spa" for a in args):
+            w.mode_spa.setChecked(True)
+            for a in args:
+                it=QListWidgetItem(Path(a).name); it.setData(Qt.UserRole,a); w.spa_list.addItem(it)
+            w.output.setText(str(Path(args[0]).with_name(Path(args[0]).stem+"_pca_results")))
+        else:
+            w.mode_csv.setChecked(True); w.input.setText(args[0]); w.output.setText(str(Path(args[0]).with_name(Path(args[0]).stem+"_pca_results")))
     w.show(); sys.exit(app.exec())
