@@ -11,7 +11,7 @@ which SpectroChemPy does not provide, still uses scikit-learn on the resulting P
 ```powershell
 conda create -n ftirpca python=3.11 pyside6 numpy pandas scipy scikit-learn matplotlib -y
 conda activate ftirpca
-pip install spectrochempy mplcursors
+pip install spectrochempy mplcursors openpyxl
 python ftir_pca_gui.py
 ```
 
@@ -19,13 +19,14 @@ Or, from an existing compatible environment:
 
 ```powershell
 conda install pyside6 numpy pandas scipy scikit-learn matplotlib -y
-pip install spectrochempy mplcursors
+pip install spectrochempy mplcursors openpyxl
 python ftir_pca_gui.py
 ```
 
 `mplcursors` is optional — it enables hover tooltips on the plots. Without it, the
 plots still work (pan/zoom/save toolbar and click-to-select in the scores table),
-just without hover labels.
+just without hover labels. `openpyxl` is only needed to load `.xlsx`/`.xls` metadata
+spreadsheets (see below); `.csv` metadata works without it.
 
 ## Dataset
 
