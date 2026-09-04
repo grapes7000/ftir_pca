@@ -72,6 +72,22 @@ def load_spa_files(paths):
     spectra=pd.DataFrame(data[:,order])
     return meta.reset_index(drop=True),wn[order],spectra.reset_index(drop=True)
 
+def export_spa_csv(paths,csv_path):
+    """Combine individual .spa files into one nicely formatted wide CSV.
+
+    Produces a plain header row (SampleID, Brand, Grade, City, State, Year,
+    then one numeric wavenumber column per point) which load_ftir_csv() already
+    supports via its numeric-column-name auto-detection, so the exported file
+    can be reloaded directly in "Wide-format CSV" mode, opened in Excel with
+    readable column names, or shared/edited like any other dataset.
+    """
+    meta,wn,spectra=load_spa_files(paths)
+    columns=list(META_DEFAULT)+[f"{w:.4f}" for w in wn]
+    out=pd.concat([meta[META_DEFAULT].reset_index(drop=True),spectra.reset_index(drop=True)],axis=1)
+    out.columns=columns
+    out.to_csv(csv_path,index=False)
+    return len(meta),len(wn)
+
 def load_ftir_csv(path):
     raw=pd.read_csv(path,low_memory=False)
     marker=raw.iloc[0,0] if len(raw) else None
@@ -219,7 +235,8 @@ class MainWindow(QMainWindow):
         badd=QPushButton("Add .spa files…"); badd.clicked.connect(self.add_spa_files)
         brem=QPushButton("Remove selected"); brem.clicked.connect(self.remove_spa_files)
         bclr=QPushButton("Clear all"); bclr.clicked.connect(self.clear_spa_files)
-        spa_btn_row.addWidget(badd); spa_btn_row.addWidget(brem); spa_btn_row.addWidget(bclr); spa_btn_row.addStretch(1)
+        bexp=QPushButton("Export combined CSV…"); bexp.clicked.connect(self.export_spa_csv)
+        spa_btn_row.addWidget(badd); spa_btn_row.addWidget(brem); spa_btn_row.addWidget(bclr); spa_btn_row.addWidget(bexp); spa_btn_row.addStretch(1)
         spa_col.addWidget(self.spa_list); spa_col.addLayout(spa_btn_row)
         self.input_stack.addWidget(spa_page)
 
@@ -258,6 +275,17 @@ class MainWindow(QMainWindow):
     def remove_spa_files(self):
         for it in self.spa_list.selectedItems(): self.spa_list.takeItem(self.spa_list.row(it))
     def clear_spa_files(self): self.spa_list.clear()
+    def export_spa_csv(self):
+        files=[self.spa_list.item(i).data(Qt.UserRole) for i in range(self.spa_list.count())]
+        if not files: QMessageBox.warning(self,"Export combined CSV","Add at least one .spa file first."); return
+        default=str(Path(files[0]).with_name("combined_ftir_spectra.csv"))
+        p,_=QFileDialog.getSaveFileName(self,"Save combined CSV",default,"CSV files (*.csv)")
+        if not p: return
+        try:
+            n_samples,n_wn=export_spa_csv(files,p)
+        except Exception as e:
+            QMessageBox.critical(self,"Export failed",str(e)); return
+        QMessageBox.information(self,"Export combined CSV",f"Wrote {n_samples} samples x {n_wn} wavenumbers to:\n{p}")
     def browse_output(self):
         p=QFileDialog.getExistingDirectory(self,"Select output folder")
         if p: self.output.setText(p)
